@@ -1,0 +1,194 @@
+//--------------------------------------------DEFINIR PÁRAMETROS--------------------------------------------//
+//**********************************************************************************************************//
+var Area_Estudio  = AOI_base;
+var startDate      = ee.Date.fromYMD(2019,4,1);
+var endDate        = ee.Date.fromYMD(2019,4,5);
+
+//Colecciones de Datos
+var Sentinel_2 = ee.ImageCollection('COPERNICUS/S2');
+
+
+//Filtrado Base
+var fecha_1 = "2019-04-01"
+var fecha_2 = "2019-04-05"
+
+var S2 = Sentinel_2.filterDate(fecha_1,fecha_2)
+           .filterBounds(Area_Estudio);
+var S2_mosaic = S2.mosaic();
+var S2__B5_B12 =S2.select(['B5','B12'])
+
+//******************************-------------Enmascaramiento de Nubes y Sombras------------*******************************************//
+//******************************-----------------------------------------------------------*******************************************//
+//Mosaico sin nubes base
+//var masks = require('users/fitoprincipe/geetools:cloud_masks')
+
+var S2_clip = ee.ImageCollection(S2_mosaic.clip(Area_Estudio));
+
+//var S2_sin_nubes = S2_clip.map(masks.hollstein_S2())
+//var image2= S2_sin_nubes.mosaic()
+var image3= S2_clip.median()
+
+//
+var Mosaico_Sentinel_base     = image3
+
+var bandas = ['B2', 'B3', 'B4', 'B8', 'B11','B12'];
+
+//-----------------------------------------Calculo de indices espectrales-----------------------------------------------------//
+// Includes the Normalized Difference Spectral Vector from (Angiuli and Trianni, 2014)
+function addIndices(img){
+  // Add Normalized Difference Spectral Vector (NDSV)
+    img = img.addBands(img.normalizedDifference(['B8', 'B4' ]).rename('NDVI'));
+    img = img.addBands(img.normalizedDifference(['B8', 'B3' ]).rename('GNDVI'));
+    img = img.addBands(img.normalizedDifference(['B8', 'B11']).rename('NDMI'));
+    img = img.addBands(img.normalizedDifference(['B8', 'B12']).rename('NBRI'));
+    img = img.addBands(img.normalizedDifference(['B3', 'B8' ]).rename('NDWI'));
+    img = img.addBands(img.normalizedDifference(['B3', 'B11']).rename('NDSI'));
+    img = img.addBands(img.normalizedDifference(['B3', 'B4' ]).rename('NDGI'));
+//FDI
+var FDI = img.expression(
+  "SWIR2/Redge",{
+    "SWIR2":img.select("B12"),
+    "Redge":img.select("B5")
+  }).rename('FDI')
+  
+ //BAIS2 
+ //https://www.researchgate.net/publication/323964124_BAIS2_Burned_Area_Index_for_Sentinel-2
+ // https://www.mdpi.com/2072-4292/11/6/622
+var bai = img.expression(
+    '(1-(sqrt((B6*B7*B8A)/(B4))))*((B12-B8A)/(sqrt(B12+B8A))+1)', {
+    'B4': img.select('B4'),
+    'B6': img.select('B6'),
+    'B7': img.select('B7'),
+    'B8A': img.select('B8A'),
+    'B12': img.select('B12'),
+    }).rename('BAI').multiply(0.00001)
+    img = img.addBands(bai.rename('BAI'));
+    
+ // Add Enhanced Vegetation Index (EVI)
+  var evi = img.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': img.select('B8'),
+      'RED': img.select('B4'),
+      'BLUE':img.select('B2')
+  }).float();
+  img = img.addBands(evi.rename('EVI'));
+  
+  // Add Soil Adjust Vegetation Index (SAVI)
+  // using L = 0.5;
+  var savi = img.expression(
+    '(NIR - RED) * (1 + 0.5)/(NIR + RED + 0.5)', {
+      'NIR': img.select('B8'),
+      'RED': img.select('B4')
+  }).float();
+  img = img.addBands(savi.rename('SAVI'));
+  
+  // Add Index-Based Built-Up Index (IBI)
+  var ibi_a =  img.expression(
+    '2*SWIR1/(SWIR1 + NIR)', {
+      'SWIR1': img.select('B11'),
+      'NIR':   img.select('B8')
+    }).rename('IBI_A');
+  var ibi_b = img.expression(
+    '(NIR/(NIR + RED)) + (GREEN/(GREEN + SWIR1))', {
+      'NIR':   img.select('B8'),
+      'RED':   img.select('B4'),
+      'GREEN': img.select('B3'),
+      'SWIR1': img.select('B11')
+    }).rename('IBI_B');
+  ibi_a = ibi_a.addBands(ibi_b);
+  var ibi = ibi_a.normalizedDifference(['IBI_A','IBI_B']);
+  img = img.addBands(ibi.rename('IBI'));
+  
+ ////////////////////////////////////////////////////////////////////////////////
+  //NIRv: Badgley, G., Field, C. B., & Berry, J. A. (2017). Canopy near-infrared reflectance and terrestrial photosynthesis. Science Advances, 3, e1602244.
+  //https://www.researchgate.net/publication/315534107_Canopy_near-infrared_reflectance_and_terrestrial_photosynthesis
+  // NIRv function: ‘image’ is a 2 band stack of NDVI and NIR
+  //////////////////////////////////////////////////////////////////////////////////////////
+  var NIRv =  img.select(['NDVI']).subtract(0.08)
+              .multiply(img.select(['B8']));//.multiply(0.0001))
+
+  img = img.addBands(savi.rename('SAVI')).addBands(NIRv.rename('NIRv'));  
+
+
+  var bsi = img.expression(
+  '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))', {
+    'BLUE':  img.select('B2'),
+    'RED':   img.select('B4'),
+    'NIR':   img.select('B8'),
+    'SWIR1': img.select('B11')
+  }).float();
+  img = img.addBands(bsi.rename('BSI'));
+  
+  var hi = img.expression(
+    'SWIR1 / SWIR2',{
+      'SWIR1': img.select('B11'),
+      'SWIR2': img.select('B12')
+    }).float();
+  img = img.addBands(hi.rename('HI'));
+
+  ///NDFI Souza
+    var gv =    [500, 900, 400, 6100, 3000, 1000];
+    var shade = [0, 0, 0, 0, 0, 0];
+    var npv =   [1400, 1700, 2200, 3000, 5500, 3000];
+    var soil =  [2000, 3000, 3400, 5800, 6000, 5800];
+    var cloud = [9000, 9600, 8000, 7800, 7200, 6500];
+    
+    /*  Do spectral unmixing on a single image  */
+    var unmixImage = ee.Image(img).select(bandas).unmix([gv, shade, npv, soil, cloud], true,true)
+                    .rename(['band_0', 'band_1', 'band_2','band_3','band_4'])
+    var newImage = ee.Image(img).select(bandas).addBands(unmixImage)
+    //var mask = newImage.select('band_4').lt(cfThreshold)
+  
+    var ndfi = ee.Image(unmixImage).expression(
+      '((GV / (1 - SHADE)) - (NPV + SOIL)) / ((GV / (1 - SHADE)) + NPV + SOIL)', {
+        'GV': ee.Image(unmixImage)   .select('band_0'),
+        'SHADE': ee.Image(unmixImage).select('band_1'),
+        'NPV': ee.Image(unmixImage)  .select('band_2'),
+        'SOIL': ee.Image(unmixImage) .select('band_3')});
+    
+    img = img.addBands(ndfi.rename('NDFI'));  
+  
+  return img;
+}
+
+
+var Stack_Base     = addIndices(Mosaico_Sentinel_base);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//Mosaico MultBanda 
+var predictionBands = Stack_Base.bandNames();
+
+//print(predictionBands)
+
+//Muestras 
+var classFeatures= Fire.merge(No_fire);
+
+// Muestras de Entranamiento
+var trainingFeatures = classFeatures;
+
+//3.Superponer los puntos de muestras en el mosaico multifecha para hacer el entrenamiento.
+var Entrenamiento = Stack_Base.sampleRegions({
+  collection: trainingFeatures,
+  properties: ['clase'],
+  scale: 30,
+  tileScale :16,
+  geometries:false
+});
+
+var classifier = ee.Classifier.smileRandomForest(50).train(Entrenamiento, 'clase', predictionBands);
+
+var classified_base     = Stack_Base    .classify(classifier);
+
+var fire = classified_base.eq(1)
+var fire =fire.updateMask(fire).rename('Fire');
+
+var FalsoColor = {min: 500.0,  max: 3000.0, bands: ['B11', 'B8', 'B2'],}; //Composición RGB 11,8,2 (SWIR,NIR,BLUE)
+var categorias = ["red", "yellow"];
+
+//Map.addLayer(S2_clip,         FalsoColor, "Sentinel 2 Base"     ,false);
+//Map.addLayer(fire, {min:1, max:1, palette: "red"}, "Fire");
+
+exports = {
+  classifier : classifier }
+ 
+//https://code.earthengine.google.com/15c506faca0b5616906ec875eb8ce6a0
